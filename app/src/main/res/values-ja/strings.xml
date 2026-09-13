@@ -54,9 +54,12 @@
     <string name="unroot_issue_cve_root">Root ヘルパー</string>
     <string name="unroot_issue_ksud">ReSukiSU ローダー</string>
     <string name="unroot_issue_exploit_logs">Exploit の一時ログ</string>
+    <string name="unroot_issue_workspace">一時アーティファクトのワークスペース</string>
     <string name="unroot_issue_root_transport_files">一時 root クライアントとソケット</string>
     <string name="unroot_issue_reboot">システム再起動要求</string>
     <string name="unroot_issue_unknown">クリーンアップ状態を確認できませんでした</string>
+    <string name="error_payload_workspace_contract">このペイロードはセッション単位の一時アーティファクトに対応していません</string>
+    <string name="error_helper_workspace_contract">Root ヘルパーはセッション単位の一時アーティファクトに対応していません</string>
     <string name="copied_to_clipboard">ログをクリップボードにコピーしました</string>
 
     <!-- Install screen -->

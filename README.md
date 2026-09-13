@@ -20,7 +20,7 @@ Root My Pixel lets you *temporarily* gain root access with ReSukiSU in just one 
 
 3. **Exploit Payload Extraction & Execution**
    - Precompiled binary payloads (`.so`) corresponding to each supported build and the native helper tool (`libcve43499root.so`) are extracted from APK assets to `/data/local/tmp`.
-   - The IonStack exploit (CVE-2026-43499) is executed to establish a local root daemon socket (`temp_su.sock`), acquiring full `root` privileges.
+   - The IonStack exploit (CVE-2026-43499) is executed in a persisted, session-scoped workspace under `/data/local/tmp` and establishes a local root daemon socket there, acquiring full `root` privileges.
 
 4. **KernelSU / ReSukiSU Integration**
    - Staging of the `ksud` binary matching the device's Kernel Module Interface (KMI, e.g., `android15-6.6`).

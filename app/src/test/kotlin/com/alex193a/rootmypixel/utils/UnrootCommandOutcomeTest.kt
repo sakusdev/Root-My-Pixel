@@ -43,4 +43,14 @@ class UnrootCommandOutcomeTest {
         assertTrue(outcome.transportUnavailable)
         assertEquals(UnrootIssue.affectedByMissingTransport, outcome.issues)
     }
+
+    @Test
+    fun parse_reportsUnexpectedWorkspaceContent() {
+        val outcome = UnrootCommandOutcome.parse(
+            "UNROOT_FAIL:workspace:unexpected-file\nUNROOT_CLEANUP_PARTIAL",
+        )
+
+        assertFalse(outcome.cleanupComplete)
+        assertEquals(listOf(UnrootIssue.Workspace), outcome.issues)
+    }
 }

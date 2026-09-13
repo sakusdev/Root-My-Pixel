@@ -44,9 +44,12 @@
     <string name="unroot_issue_cve_root">Root helper</string>
     <string name="unroot_issue_ksud">ReSukiSU loader</string>
     <string name="unroot_issue_exploit_logs">Exploit temporary logs</string>
+    <string name="unroot_issue_workspace">Temporary artifact workspace</string>
     <string name="unroot_issue_root_transport_files">Temporary root client and socket</string>
     <string name="unroot_issue_reboot">System reboot request</string>
     <string name="unroot_issue_unknown">Cleanup status could not be verified</string>
+    <string name="error_payload_workspace_contract">This payload does not support session-scoped temporary artifacts</string>
+    <string name="error_helper_workspace_contract">The root helper does not support session-scoped temporary artifacts</string>
     <string name="copied_to_clipboard">Log copied to clipboard</string>
 
     <!-- Install screen -->

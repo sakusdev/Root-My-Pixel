@@ -24,6 +24,10 @@ import com.alex193a.rootmypixel.shizuku.ExploitService
 import com.alex193a.rootmypixel.shizuku.IExploitService
 import com.alex193a.rootmypixel.utils.NativeProbe
 import com.alex193a.rootmypixel.utils.RootShellProbe
+import com.alex193a.rootmypixel.utils.TempArtifactPaths
+import com.alex193a.rootmypixel.utils.TempArtifactSessionResolution
+import com.alex193a.rootmypixel.utils.TempArtifactSessionState
+import com.alex193a.rootmypixel.utils.TempArtifactSessionStore
 import com.alex193a.rootmypixel.utils.UnrootCommandOutcome
 import com.alex193a.rootmypixel.utils.UnrootIssue
 import kotlinx.coroutines.CancellationException
@@ -45,6 +49,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val resolveTargetUseCase: ResolveTargetUseCase by lazy {
         get(ResolveTargetUseCase::class.java)
     }
+    private val artifactSessionStore = TempArtifactSessionStore(app)
 
     private val mutableState = MutableStateFlow(InstallUiState())
     private val mutableShizukuAvailable = MutableStateFlow(false)
@@ -256,7 +261,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
             .daemon(false)
             .processNameSuffix("exploit_service")
-            .version(1)
+            .version(2)
 
         var service: IExploitService? = null
         val conn = object : ServiceConnection {
@@ -296,7 +301,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
             .daemon(false)
             .processNameSuffix("exploit_service")
-            .version(1)
+            .version(2)
         Shizuku.unbindUserService(args, handle.conn, true)
     }
 
@@ -361,32 +366,56 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun executeUnrootScript(script: String): UnrootCommandOutcome {
+        val artifactPaths = artifactPathsForExistingTransport()
+            ?: return unavailableUnrootOutcome()
+        val configuredScript = artifactPaths.exportInto(script)
+        artifactPaths.sessionId?.let { sessionId ->
+            artifactSessionStore.markState(sessionId, TempArtifactSessionState.CleanupPending)
+        }
         val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
         fun parseAttempt(transport: String, output: String): UnrootCommandOutcome? {
             val outcome = UnrootCommandOutcome.parse(output)
             appendUnrootLog("[*] $transport output:\n${output.ifBlank { "no output" }}")
-            return if (outcome.cleanupComplete ||
+            val accepted = if (outcome.cleanupComplete ||
                 (outcome.hasStructuredOutput && !outcome.transportUnavailable)
             ) outcome else null
+            if (accepted?.cleanupComplete == true) {
+                artifactPaths.sessionId?.let { sessionId ->
+                    if (!artifactSessionStore.clearAfterCleanup(sessionId)) {
+                        appendUnrootLog(
+                            "[!] Cleanup succeeded but the session record could not be cleared",
+                        )
+                    }
+                }
+            }
+            return accepted
         }
 
-        runCatching { runCommand(listOf("su", "-c", script)).output }
+        runCatching { runCommand(listOf("su", "-c", configuredScript)).output }
             .getOrNull()
             ?.let { parseAttempt("su", it) }
             ?.let { return it }
 
         if (helper.exists()) {
-            runCatching { runCommand(listOf(helper.absolutePath, "-c", script)).output }
+            runCatching {
+                runCommand(
+                    listOf(helper.absolutePath, "-c", configuredScript),
+                    environment = artifactPaths.environment(),
+                ).output
+            }
                 .getOrNull()
                 ?.let { parseAttempt("CVE helper", it) }
                 ?.let { return it }
         }
 
-        if (isShizukuShellActive()) {
+        if (isShizukuShellActive() &&
+            File(artifactPaths.suClient).exists() &&
+            File(artifactPaths.suSocket).exists()
+        ) {
             val handle = runCatching { bindExploitService() }.getOrNull()
             if (handle != null) {
                 try {
-                    val command = "$SHIZUKU_CVE_SU -c ${shellQuote(script)}"
+                    val command = artifactPaths.cveSuShellCommand(configuredScript)
                     parseAttempt("Shizuku CVE su", handle.service.exec(command))?.let { return it }
                 } catch (error: Exception) {
                     appendUnrootLog("[-] Shizuku CVE unroot error: ${error.message}")
@@ -396,32 +425,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        return UnrootCommandOutcome(
+        return unavailableUnrootOutcome()
+    }
+
+    private fun unavailableUnrootOutcome(): UnrootCommandOutcome = UnrootCommandOutcome(
             cleanupComplete = false,
             rebootRequested = false,
             transportUnavailable = true,
             issues = UnrootIssue.affectedByMissingTransport,
             hasStructuredOutput = true,
         )
-    }
 
     private fun requestReboot(): Boolean {
+        val artifactPaths = artifactPathsForExistingTransport() ?: return false
         val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
         val commands = buildList {
             add(listOf("su", "-c", REBOOT_COMMAND))
             if (helper.exists()) add(listOf(helper.absolutePath, "-c", REBOOT_COMMAND))
         }
         commands.forEach { command ->
-            val output = runCatching { runCommand(command).output }.getOrDefault("")
+            val environment = if (command.firstOrNull() == helper.absolutePath) {
+                artifactPaths.environment()
+            } else {
+                emptyMap()
+            }
+            val output = runCatching {
+                runCommand(command, environment = environment).output
+            }.getOrDefault("")
             appendUnrootLog("[*] Reboot attempt: ${output.ifBlank { "no output" }}")
             if (output.contains("UNROOT_REBOOT_REQUESTED")) return true
         }
 
-        if (isShizukuShellActive()) {
+        if (isShizukuShellActive() &&
+            File(artifactPaths.suClient).exists() &&
+            File(artifactPaths.suSocket).exists()
+        ) {
             val handle = runCatching { bindExploitService() }.getOrNull() ?: return false
             try {
                 val output = handle.service.exec(
-                    "$SHIZUKU_CVE_SU -c ${shellQuote(REBOOT_COMMAND)}",
+                    artifactPaths.cveSuShellCommand(REBOOT_COMMAND),
                 )
                 appendUnrootLog("[*] Shizuku CVE reboot attempt: $output")
                 return output.contains("UNROOT_REBOOT_REQUESTED")
@@ -434,7 +476,77 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return false
     }
 
+    private fun artifactPathsForExistingTransport(): TempArtifactPaths? =
+        when (val resolution = artifactSessionStore.resolve()) {
+            is TempArtifactSessionResolution.Found -> {
+                val runningDaemonPaths = probeDaemonWorkspace()
+                resolution.session.paths.takeIf {
+                    runningDaemonPaths == null || runningDaemonPaths == it
+                }
+            }
+            is TempArtifactSessionResolution.Invalid -> null
+            TempArtifactSessionResolution.Missing -> {
+                val runningDaemonPaths = probeDaemonWorkspace()
+                if (runningDaemonPaths != null && !runningDaemonPaths.isLegacy) {
+                    artifactSessionStore.adopt(runningDaemonPaths)?.paths
+                } else {
+                    TempArtifactPaths.legacy()
+                }
+            }
+        }
+
+    private fun probeDaemonWorkspace(): TempArtifactPaths? {
+        val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+        if (!helper.exists()) return null
+        val directResult = runCatching {
+            runCommand(
+                listOf(helper.absolutePath, "--daemon-work-dir"),
+                ROOT_PROBE_TIMEOUT_SECONDS,
+            )
+        }.getOrNull()
+        parseReportedWorkDir(directResult?.takeIf { it.code == 0 }?.output)
+            ?.let { return it }
+
+        val configuredPaths = readConfiguredWorkDir() ?: return null
+        val verifiedResult = runCatching {
+            runCommand(
+                listOf(helper.absolutePath, "--daemon-work-dir"),
+                ROOT_PROBE_TIMEOUT_SECONDS,
+                configuredPaths.environment(),
+            )
+        }.getOrNull() ?: return null
+        return parseReportedWorkDir(verifiedResult.takeIf { it.code == 0 }?.output)
+            ?.takeIf { it == configuredPaths }
+    }
+
+    private fun readConfiguredWorkDir(): TempArtifactPaths? {
+        parseReportedWorkDir(
+            runCatching { File(TempArtifactPaths.WORK_DIR_CONFIG).readText() }.getOrNull(),
+        )?.let { return it }
+        if (!isShizukuShellActive()) return null
+
+        val handle = runCatching { bindExploitService() }.getOrNull() ?: return null
+        return try {
+            parseReportedWorkDir(
+                handle.service.exec(
+                    "cat ${shellQuote(TempArtifactPaths.WORK_DIR_CONFIG)} 2>/dev/null || true",
+                ),
+            )
+        } catch (_: Exception) {
+            null
+        } finally {
+            unbindExploitService(handle)
+        }
+    }
+
+    private fun parseReportedWorkDir(output: String?): TempArtifactPaths? = output
+        ?.lineSequence()
+        ?.map(String::trim)
+        ?.mapNotNull(TempArtifactPaths::fromWorkDir)
+        ?.firstOrNull()
+
     private fun findAvailableRootTransport(): RootTransport? {
+        val artifactPaths = artifactPathsForExistingTransport() ?: return null
         val suResult = runCatching {
             runCommand(listOf("su", "-c", ROOT_ID_COMMAND), ROOT_PROBE_TIMEOUT_SECONDS)
         }.getOrNull()
@@ -448,6 +560,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 runCommand(
                     listOf(helper.absolutePath, "-c", ROOT_ID_COMMAND),
                     ROOT_PROBE_TIMEOUT_SECONDS,
+                    artifactPaths.environment(),
                 )
             }.getOrNull()
             if (helperResult != null &&
@@ -457,14 +570,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        if (!File(SHIZUKU_CVE_SU).exists() ||
-            !File(SHIZUKU_CVE_SOCKET).exists() ||
+        if (!File(artifactPaths.suClient).exists() ||
+            !File(artifactPaths.suSocket).exists() ||
             !isShizukuShellActive()
         ) return null
 
         val handle = runCatching { bindExploitService() }.getOrNull() ?: return null
         return try {
-            val output = handle.service.exec("$SHIZUKU_CVE_SU -c '$ROOT_ID_COMMAND'")
+            val output = handle.service.exec(
+                artifactPaths.cveSuShellCommand(ROOT_ID_COMMAND),
+            )
             if (RootShellProbe.isRoot(0, output)) RootTransport.ShizukuCveSu else null
         } catch (_: Exception) {
             null
@@ -485,8 +600,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun runCommand(
         command: List<String>,
         timeoutSeconds: Long = COMMAND_TIMEOUT_SECONDS,
+        environment: Map<String, String> = emptyMap(),
     ): CommandResult {
-        val process = ProcessBuilder(command).redirectErrorStream(true).start()
+        val processBuilder = ProcessBuilder(command).redirectErrorStream(true)
+        processBuilder.environment().putAll(environment)
+        val process = processBuilder.start()
         val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
         if (!finished) {
             process.destroyForcibly()
@@ -529,8 +647,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val COMMAND_TIMEOUT_CODE = 124
         private const val ROOT_PROBE_TIMEOUT_SECONDS = 10L
         private const val ROOT_ID_COMMAND = "id -u"
-        private const val SHIZUKU_CVE_SU = "/data/local/tmp/su"
-        private const val SHIZUKU_CVE_SOCKET = "/data/local/tmp/temp_su.sock"
         private const val REBOOT_COMMAND =
             "sync; if svc power reboot || reboot; then " +
                     "echo UNROOT_REBOOT_REQUESTED; else echo UNROOT_FAIL:reboot:${'$'}?; fi"

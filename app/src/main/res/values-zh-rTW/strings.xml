@@ -44,9 +44,12 @@
     <string name="unroot_issue_cve_root">Root 輔助程式</string>
     <string name="unroot_issue_ksud">ReSukiSU 載入器</string>
     <string name="unroot_issue_exploit_logs">漏洞利用暫存記錄</string>
+    <string name="unroot_issue_workspace">暫時成品工作區</string>
     <string name="unroot_issue_root_transport_files">暫時 Root 用戶端與通訊端</string>
     <string name="unroot_issue_reboot">系統重新啟動要求</string>
     <string name="unroot_issue_unknown">無法確認清理狀態</string>
+    <string name="error_payload_workspace_contract">此酬載不支援依工作階段管理的暫存成品</string>
+    <string name="error_helper_workspace_contract">Root 輔助程式不支援依工作階段管理的暫存成品</string>
     <string name="copied_to_clipboard">日誌已複製到剪貼簿</string>
 
     <!-- Install screen -->

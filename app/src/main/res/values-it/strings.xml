@@ -42,9 +42,12 @@
     <string name="unroot_issue_cve_root">Helper root</string>
     <string name="unroot_issue_ksud">Loader ReSukiSU</string>
     <string name="unroot_issue_exploit_logs">Log temporanei dell’exploit</string>
+    <string name="unroot_issue_workspace">Workspace temporaneo degli artefatti</string>
     <string name="unroot_issue_root_transport_files">Client e socket root temporanei</string>
     <string name="unroot_issue_reboot">Richiesta di riavvio del sistema</string>
     <string name="unroot_issue_unknown">Impossibile verificare lo stato della pulizia</string>
+    <string name="error_payload_workspace_contract">Questo payload non supporta gli artefatti temporanei associati alla sessione</string>
+    <string name="error_helper_workspace_contract">L’helper root non supporta gli artefatti temporanei associati alla sessione</string>
     <string name="copied_to_clipboard">Log copiato negli appunti</string>
 
     <!-- Install screen -->

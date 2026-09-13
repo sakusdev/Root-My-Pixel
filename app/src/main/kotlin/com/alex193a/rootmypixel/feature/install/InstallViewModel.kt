@@ -26,6 +26,12 @@ import com.alex193a.rootmypixel.shizuku.IExploitService
 import com.alex193a.rootmypixel.utils.KernelSuInstallChecks
 import com.alex193a.rootmypixel.utils.NativeProbe
 import com.alex193a.rootmypixel.utils.RootShellProbe
+import com.alex193a.rootmypixel.utils.TempArtifactPaths
+import com.alex193a.rootmypixel.utils.TempArtifactSession
+import com.alex193a.rootmypixel.utils.TempArtifactSessionResolution
+import com.alex193a.rootmypixel.utils.TempArtifactSessionState
+import com.alex193a.rootmypixel.utils.TempArtifactSessionStore
+import com.alex193a.rootmypixel.utils.TempArtifactWorkspaceContract
 import com.alex193a.rootmypixel.utils.UnrootCommandOutcome
 import com.alex193a.rootmypixel.utils.UnrootIssue
 import kotlinx.coroutines.CancellationException
@@ -56,6 +62,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
     private val downloadPayloadsUseCase: DownloadPayloadsUseCase by lazy {
         get(DownloadPayloadsUseCase::class.java)
     }
+    private val artifactSessionStore = TempArtifactSessionStore(app)
 
     private val mutableState = MutableStateFlow(InstallUiState())
     private val mutableTargetCatalog = MutableStateFlow(TargetCatalogUiState())
@@ -148,6 +155,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         discoveryJob?.cancel()
 
         installJob = viewModelScope.launch(Dispatchers.IO) {
+            var artifactSession: TempArtifactSession? = null
             mutableState.value = InstallUiState(
                 phase = InstallPhase.Checking,
                 probeOutput = mutableState.value.probeOutput,
@@ -201,11 +209,21 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 }
                 appendLog("[*] Using Shizuku shell access: $useShizuku")
 
+                artifactSession = prepareArtifactSession()
+                val artifactPaths = artifactSession.paths
+                appendLog("[*] Temporary workspace: ${artifactPaths.workDir}")
+
                 setPhase(InstallPhase.Exploiting, app.getString(R.string.status_exploit))
-                when (val exploitResult = executeExploit(payloads)) {
+                when (val exploitResult = executeExploit(payloads, artifactPaths)) {
                     is Result.Success -> Unit
                     is Result.Error -> {
                         val error = exploitResult.error
+                        artifactPaths.sessionId?.let { sessionId ->
+                            artifactSessionStore.markState(
+                                sessionId,
+                                TempArtifactSessionState.CleanupPending,
+                            )
+                        }
                         appendLog("[-] ${error.message}")
                         mutableState.value = mutableState.value.copy(
                             phase = InstallPhase.Failed,
@@ -215,6 +233,12 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                         return@launch
                     }
                 }
+                check(
+                    artifactSessionStore.markState(
+                        artifactPaths.sessionId!!,
+                        TempArtifactSessionState.Active,
+                    ),
+                ) { "Unable to persist active temporary artifact session" }
 
                 if (permissiveOnly) {
                     setPhase(InstallPhase.Installed, "SELinux permissive + root shell ready")
@@ -230,7 +254,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                     )
                 } else {
                     setPhase(InstallPhase.LoadingKernelSu, app.getString(R.string.status_loading_ksu))
-                    installKernelSu(payloads)
+                    installKernelSu(payloads, artifactPaths)
 
                     setPhase(InstallPhase.Installed, app.getString(R.string.status_ksu_active))
                     appendLog(app.getString(R.string.log_install_complete))
@@ -248,6 +272,12 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 }
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
+                artifactSession?.paths?.sessionId?.let { sessionId ->
+                    artifactSessionStore.markState(
+                        sessionId,
+                        TempArtifactSessionState.CleanupPending,
+                    )
+                }
                 appendLog("[-] ${error.message ?: error.javaClass.simpleName}")
                 setPhase(InstallPhase.Failed, app.getString(R.string.status_install_failed))
             }
@@ -273,7 +303,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         )
             .daemon(false)
             .processNameSuffix("exploit_service")
-            .version(1)
+            .version(2)
 
         var service: IExploitService? = null
         val conn = object : ServiceConnection {
@@ -313,7 +343,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         )
             .daemon(false)
             .processNameSuffix("exploit_service")
-            .version(1)
+            .version(2)
         Shizuku.unbindUserService(args, handle.conn, true)
     }
 
@@ -321,8 +351,9 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
     private suspend fun executeExploit(
         payloads: VerifiedPayloads,
+        artifactPaths: TempArtifactPaths,
     ): Result<Unit, PayloadExecutionError> {
-        return when (val result = executeExploitViaShizuku(payloads)) {
+        return when (val result = executeExploitViaShizuku(payloads, artifactPaths)) {
             is Result.Success -> {
                 appendLog(app.getString(R.string.log_bootstrap_root))
                 Result.Success(Unit)
@@ -333,6 +364,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
     private suspend fun executeExploitViaShizuku(
         payloads: VerifiedPayloads,
+        artifactPaths: TempArtifactPaths,
     ): Result<Unit, PayloadExecutionError> {
         val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
         require(helper.exists()) { app.getString(R.string.error_helper_unavailable) }
@@ -342,10 +374,18 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
         try {
             val logPrefix = mutableState.value.log
+            val exploitBytes = payloads.exploit.readBytes()
+            val helperBytes = helper.readBytes()
+            require(TempArtifactWorkspaceContract.isSupported(exploitBytes)) {
+                app.getString(R.string.error_payload_workspace_contract)
+            }
+            require(TempArtifactWorkspaceContract.isSupported(helperBytes)) {
+                app.getString(R.string.error_helper_workspace_contract)
+            }
             handle.service.startExploit(
-                payloads.exploit.readBytes(),
-                helper.readBytes(),
-                "/data/local/tmp/exploit.log",
+                exploitBytes,
+                helperBytes,
+                artifactPaths.workDir,
             )
 
             val startedAt = SystemClock.elapsedRealtime()
@@ -354,7 +394,9 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
             while (handle.service.isRunning) {
                 val remoteLog = handle.service.getLog()
-                val fileLog = handle.service.exec("cat /data/local/tmp/exploit.log 2>/dev/null || true")
+                val fileLog = handle.service.exec(
+                    "cat ${shellQuote(artifactPaths.exploitLog)} 2>/dev/null || true",
+                )
                 val currentLog = if (fileLog.length > remoteLog.length) fileLog else remoteLog
 
                 if (currentLog != lastRawLog) {
@@ -374,7 +416,9 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
             val exitCode = handle.service.waitFor()
             val remoteLog = handle.service.getLog()
-            val fileLog = handle.service.exec("cat /data/local/tmp/exploit.log 2>/dev/null || true")
+            val fileLog = handle.service.exec(
+                "cat ${shellQuote(artifactPaths.exploitLog)} 2>/dev/null || true",
+            )
             val finalLog = listOf(remoteLog, fileLog)
                 .filter(String::isNotBlank)
                 .distinct()
@@ -396,17 +440,18 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 is Result.Success -> parsed.data
                 is Result.Error -> {
                     if (PayloadResultParser.hasLegacySuccessMarkers(finalLog)) {
-                        return Result.Success(Unit)
+                        null
+                    } else {
+                        return Result.Error(
+                            PayloadExecutionError(
+                                message = parsed.error.message,
+                                retryable = false,
+                            ),
+                        )
                     }
-                    return Result.Error(
-                        PayloadExecutionError(
-                            message = parsed.error.message,
-                            retryable = false,
-                        ),
-                    )
                 }
             }
-            if (!outcome.success) {
+            if (outcome != null && !outcome.success) {
                 val message = if (outcome.reason == PayloadReason.ROUTE_DISABLED) {
                     app.getString(R.string.error_route_disabled)
                 } else {
@@ -425,10 +470,28 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                     PayloadExecutionError(
                         message = app.getString(R.string.error_success_marker),
                         retryable = false,
-                        reason = outcome.reason,
+                        reason = outcome?.reason,
                     ),
                 )
             }
+            val daemonWorkspace = runHelper(
+                helper,
+                artifactPaths,
+                "--daemon-work-dir",
+            )
+            if (daemonWorkspace.code != 0 ||
+                daemonWorkspace.output.lineSequence().none { it.trim() == artifactPaths.workDir }
+            ) {
+                return Result.Error(
+                    PayloadExecutionError(
+                        message = "Root daemon workspace mismatch: expected " +
+                            "${artifactPaths.workDir}, got " +
+                            daemonWorkspace.output.ifBlank { "no response" }.take(200),
+                        retryable = false,
+                    ),
+                )
+            }
+            appendLog("[+] Root daemon workspace verified")
             return Result.Success(Unit)
         } finally {
             unbindExploitService(handle)
@@ -450,14 +513,17 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
     // --- KernelSU ---
 
-    private fun installKernelSu(payloads: VerifiedPayloads) {
+    private fun installKernelSu(
+        payloads: VerifiedPayloads,
+        artifactPaths: TempArtifactPaths,
+    ) {
         val ksudSource = payloads.kernelSu.absolutePath
-        val ksudDest = "/data/local/tmp/ksud-pixel"
+        val ksudDest = artifactPaths.kernelSuLoader
         val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
 
         // 1. Wait for daemon to be ready
-        awaitDaemonSocket()
-        diagnoseDaemon()
+        awaitDaemonSocket(artifactPaths)
+        diagnoseDaemon(artifactPaths)
 
         // 2. Stage ksud via daemon root (cp + chmod + chown)
         appendLog("[*] Staging ReSukiSU binary...")
@@ -465,9 +531,9 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             "chown root:root $ksudDest"
         var stageSuccess = false
         for (attempt in 1..5) {
-            val result = runHelper(helper, "-c", stageCmd)
+            val result = runHelper(helper, artifactPaths, "-c", stageCmd)
             if (result.code == 0) {
-                val verify = runHelper(helper, "-c", "ls -la $ksudDest")
+                val verify = runHelper(helper, artifactPaths, "-c", "ls -la $ksudDest")
                 if (verify.output.contains("rwxr-xr-x") ||
                     verify.output.contains("-rwxr-xr-x")) {
                     appendLog("ReSukiSU staged: ${verify.output.trim()}")
@@ -484,7 +550,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
         // 3. Execute late-load via daemon root
         appendLog("[*] Triggering KernelSU late-load (kmi=${payloads.kmi})...")
-        val lateResult = runHelper(helper, "-c",
+        val lateResult = runHelper(helper, artifactPaths, "-c",
             "$ksudDest late-load --kmi ${payloads.kmi}")
         if (lateResult.output.isNotBlank()) {
             appendLog(lateResult.output.take(2000))
@@ -492,17 +558,18 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
         // 4. Verify the driver itself. ReSukiSU LKM mode does not create the
         // legacy filesystem paths that were previously probed here.
-        verifyKernelSuLoaded(helper, ksudDest, lateResult)
+        verifyKernelSuLoaded(helper, artifactPaths, ksudDest, lateResult)
 
         // 5. Register only a known ReSukiSU production manager signature.
         // Package name alone is not a sufficient trust boundary for a root manager.
-        registerManager(helper, ksudDest)
+        registerManager(helper, artifactPaths, ksudDest)
 
         appendLog(app.getString(R.string.log_ksu_control_verified))
     }
 
     private fun verifyKernelSuLoaded(
         helper: File,
+        artifactPaths: TempArtifactPaths,
         ksudDest: String,
         lateResult: CommandResult,
     ) {
@@ -521,7 +588,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 return
             }
 
-            debugResult = runHelper(helper, "-c", "$ksudDest debug info")
+            debugResult = runHelper(helper, artifactPaths, "-c", "$ksudDest debug info")
             if (debugResult.code == 0 &&
                 KernelSuInstallChecks.debugInfoShowsActiveKernelSu(debugResult.output)
             ) {
@@ -532,7 +599,12 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 return
             }
 
-            moduleResult = runHelper(helper, "-c", "grep '^kernelsu ' /proc/modules")
+            moduleResult = runHelper(
+                helper,
+                artifactPaths,
+                "-c",
+                "grep '^kernelsu ' /proc/modules",
+            )
             if (moduleResult.code == 0 &&
                 KernelSuInstallChecks.procModulesShowsActiveKernelSu(moduleResult.output)
             ) {
@@ -561,7 +633,11 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         )
     }
 
-    private fun registerManager(helper: File, ksudDest: String) {
+    private fun registerManager(
+        helper: File,
+        artifactPaths: TempArtifactPaths,
+        ksudDest: String,
+    ) {
         val apkPath = runCatching {
             app.packageManager.getApplicationInfo(
                 RESUKISU_PACKAGE,
@@ -577,6 +653,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         appendLog("[*] Verifying the installed ReSukiSU manager signature...")
         val signatureResult = runHelper(
             helper,
+            artifactPaths,
             "-c",
             "$ksudDest debug get-sign ${shellQuote(apkPath)}",
         )
@@ -600,6 +677,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         appendLog("[*] Registering the ReSukiSU manager with the module...")
         val setResult = runHelper(
             helper,
+            artifactPaths,
             "-c",
             "$ksudDest kernel dynamic-manager set ${signature.size} ${signature.hash}",
         )
@@ -611,7 +689,12 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             return
         }
 
-        val getResult = runHelper(helper, "-c", "$ksudDest kernel dynamic-manager get")
+        val getResult = runHelper(
+            helper,
+            artifactPaths,
+            "-c",
+            "$ksudDest kernel dynamic-manager get",
+        )
         val registeredSignature = if (getResult.code == 0) {
             KernelSuInstallChecks.parseManagerSignature(getResult.output)
         } else {
@@ -631,11 +714,16 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
     private fun shellQuote(value: String): String =
         "'${value.replace("'", "'\"'\"'")}'"
 
-    private fun runHelper(helper: File, vararg arguments: String): CommandResult {
+    private fun runHelper(
+        helper: File,
+        artifactPaths: TempArtifactPaths,
+        vararg arguments: String,
+    ): CommandResult {
         for (attempt in 1..5) {
-            val process = ProcessBuilder(listOf(helper.absolutePath) + arguments)
+            val processBuilder = ProcessBuilder(listOf(helper.absolutePath) + arguments)
                 .redirectErrorStream(true)
-                .start()
+            processBuilder.environment().putAll(artifactPaths.environment())
+            val process = processBuilder.start()
             val finished = process.waitFor(COMMAND_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             if (!finished) {
                 process.destroyForcibly()
@@ -656,6 +744,118 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             Thread.sleep(1500)
         }
         return CommandResult(1, "runHelper: exhausted retries")
+    }
+
+    private fun prepareArtifactSession(): TempArtifactSession =
+        when (val resolution = artifactSessionStore.resolve()) {
+            is TempArtifactSessionResolution.Found -> {
+                val runningDaemonPaths = probeDaemonWorkspace()
+                check(runningDaemonPaths == null || runningDaemonPaths == resolution.session.paths) {
+                    "The active root daemon belongs to a different temporary artifact session"
+                }
+                resolution.session
+            }
+            is TempArtifactSessionResolution.Invalid -> throw IllegalStateException(
+                "Invalid temporary artifact session: ${resolution.reason}",
+            )
+            TempArtifactSessionResolution.Missing -> {
+                val runningDaemonPaths = probeDaemonWorkspace()
+                when {
+                    runningDaemonPaths == null && !legacyDaemonProvidesRoot() ->
+                        artifactSessionStore.getOrCreate()
+                    runningDaemonPaths == null -> throw IllegalStateException(
+                        "A legacy root daemon is still active; reboot before starting a new session",
+                    )
+                    runningDaemonPaths.isLegacy -> throw IllegalStateException(
+                        "A legacy root daemon is still active; reboot before starting a new session",
+                    )
+                    else -> artifactSessionStore.adopt(runningDaemonPaths)
+                        ?: throw IllegalStateException(
+                            "Unable to recover the active temporary artifact session",
+                        )
+                }
+            }
+        }
+
+    private fun artifactPathsForExistingTransport(): TempArtifactPaths? =
+        when (val resolution = artifactSessionStore.resolve()) {
+            is TempArtifactSessionResolution.Found -> {
+                val runningDaemonPaths = probeDaemonWorkspace()
+                resolution.session.paths.takeIf {
+                    runningDaemonPaths == null || runningDaemonPaths == it
+                }
+            }
+            is TempArtifactSessionResolution.Invalid -> null
+            TempArtifactSessionResolution.Missing -> {
+                val runningDaemonPaths = probeDaemonWorkspace()
+                if (runningDaemonPaths != null && !runningDaemonPaths.isLegacy) {
+                    artifactSessionStore.adopt(runningDaemonPaths)?.paths
+                } else {
+                    TempArtifactPaths.legacy()
+                }
+            }
+        }
+
+    private fun probeDaemonWorkspace(): TempArtifactPaths? {
+        val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+        if (!helper.exists()) return null
+        val directResult = runCatching {
+            runCommand(
+                listOf(helper.absolutePath, "--daemon-work-dir"),
+                ROOT_PROBE_TIMEOUT_SECONDS,
+            )
+        }.getOrNull()
+        parseReportedWorkDir(directResult?.takeIf { it.code == 0 }?.output)
+            ?.let { return it }
+
+        val configuredPaths = readConfiguredWorkDir() ?: return null
+        val verifiedResult = runCatching {
+            runCommand(
+                listOf(helper.absolutePath, "--daemon-work-dir"),
+                ROOT_PROBE_TIMEOUT_SECONDS,
+                configuredPaths.environment(),
+            )
+        }.getOrNull() ?: return null
+        return parseReportedWorkDir(verifiedResult.takeIf { it.code == 0 }?.output)
+            ?.takeIf { it == configuredPaths }
+    }
+
+    private fun readConfiguredWorkDir(): TempArtifactPaths? {
+        parseReportedWorkDir(
+            runCatching { File(TempArtifactPaths.WORK_DIR_CONFIG).readText() }.getOrNull(),
+        )?.let { return it }
+        if (!hasShizukuPermission()) return null
+
+        val handle = runCatching { bindExploitService() }.getOrNull() ?: return null
+        return try {
+            parseReportedWorkDir(
+                handle.service.exec(
+                    "cat ${shellQuote(TempArtifactPaths.WORK_DIR_CONFIG)} 2>/dev/null || true",
+                ),
+            )
+        } catch (_: Exception) {
+            null
+        } finally {
+            unbindExploitService(handle)
+        }
+    }
+
+    private fun parseReportedWorkDir(output: String?): TempArtifactPaths? = output
+        ?.lineSequence()
+        ?.map(String::trim)
+        ?.mapNotNull(TempArtifactPaths::fromWorkDir)
+        ?.firstOrNull()
+
+    private fun legacyDaemonProvidesRoot(): Boolean {
+        val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+        if (!helper.exists()) return false
+        val result = runCatching {
+            runCommand(
+                listOf(helper.absolutePath, "-c", ROOT_ID_COMMAND),
+                ROOT_PROBE_TIMEOUT_SECONDS,
+            )
+        }.getOrNull() ?: return false
+        return RootShellProbe.isRoot(result.code, result.output)
     }
 
     fun refreshUnrootAvailability() {
@@ -679,6 +879,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun findAvailableRootTransport(): RootTransport? {
+        val artifactPaths = artifactPathsForExistingTransport() ?: return null
         val suResult = runCatching {
             runCommand(listOf("su", "-c", ROOT_ID_COMMAND), ROOT_PROBE_TIMEOUT_SECONDS)
         }.getOrNull()
@@ -692,6 +893,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 runCommand(
                     listOf(helper.absolutePath, "-c", ROOT_ID_COMMAND),
                     ROOT_PROBE_TIMEOUT_SECONDS,
+                    artifactPaths.environment(),
                 )
             }.getOrNull()
             if (helperResult != null &&
@@ -701,14 +903,16 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             }
         }
 
-        if (!File(SHIZUKU_CVE_SU).exists() ||
-            !File(SHIZUKU_CVE_SOCKET).exists() ||
+        if (!File(artifactPaths.suClient).exists() ||
+            !File(artifactPaths.suSocket).exists() ||
             !hasShizukuPermission()
         ) return null
 
         val handle = runCatching { bindExploitService() }.getOrNull() ?: return null
         return try {
-            val output = handle.service.exec("$SHIZUKU_CVE_SU -c '$ROOT_ID_COMMAND'")
+            val output = handle.service.exec(
+                artifactPaths.cveSuShellCommand(ROOT_ID_COMMAND),
+            )
             if (RootShellProbe.isRoot(0, output)) RootTransport.ShizukuCveSu else null
         } catch (_: Exception) {
             null
@@ -804,39 +1008,59 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun executeUnrootScript(script: String): UnrootCommandOutcome {
+        val artifactPaths = artifactPathsForExistingTransport()
+            ?: return unavailableUnrootOutcome()
+        val configuredScript = artifactPaths.exportInto(script)
+        artifactPaths.sessionId?.let { sessionId ->
+            artifactSessionStore.markState(sessionId, TempArtifactSessionState.CleanupPending)
+        }
+
         fun parseAttempt(transport: String, result: CommandResult): UnrootCommandOutcome? {
             val outcome = UnrootCommandOutcome.parse(result.output)
             appendLog(
                 "[*] $transport output (exit=${result.code}):\n" +
                         result.output.ifBlank { "no output" },
             )
-            return if (outcome.cleanupComplete ||
+            val accepted = if (outcome.cleanupComplete ||
                 (outcome.hasStructuredOutput && !outcome.transportUnavailable)
             ) outcome else null
+            if (accepted?.cleanupComplete == true) {
+                artifactPaths.sessionId?.let { sessionId ->
+                    if (!artifactSessionStore.clearAfterCleanup(sessionId)) {
+                        appendLog("[!] Cleanup succeeded but the session record could not be cleared")
+                    }
+                }
+            }
+            return accepted
         }
 
-        runCatching { runCommand(listOf("su", "-c", script)) }
+        runCatching { runCommand(listOf("su", "-c", configuredScript)) }
             .getOrNull()
             ?.let { parseAttempt("ReSukiSU app su", it) }
             ?.let { return it }
 
         val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
         if (helper.exists()) {
-            runCatching { runCommand(listOf(helper.absolutePath, "-c", script)) }
+            runCatching {
+                runCommand(
+                    listOf(helper.absolutePath, "-c", configuredScript),
+                    environment = artifactPaths.environment(),
+                )
+            }
                 .getOrNull()
                 ?.let { parseAttempt("current-install CVE helper", it) }
                 ?.let { return it }
         }
 
         if (hasShizukuPermission() &&
-            File(SHIZUKU_CVE_SU).exists() &&
-            File(SHIZUKU_CVE_SOCKET).exists()
+            File(artifactPaths.suClient).exists() &&
+            File(artifactPaths.suSocket).exists()
         ) {
             val handle = runCatching { bindExploitService() }.getOrNull()
             if (handle != null) {
                 try {
                     val output = handle.service.exec(
-                        "$SHIZUKU_CVE_SU -c ${shellQuote(script)}",
+                        artifactPaths.cveSuShellCommand(configuredScript),
                     )
                     parseAttempt("current-install CVE su via Shizuku", CommandResult(0, output))
                         ?.let { return it }
@@ -848,36 +1072,46 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             }
         }
 
-        return UnrootCommandOutcome(
+        return unavailableUnrootOutcome()
+    }
+
+    private fun unavailableUnrootOutcome(): UnrootCommandOutcome = UnrootCommandOutcome(
             cleanupComplete = false,
             rebootRequested = false,
             transportUnavailable = true,
             issues = UnrootIssue.affectedByMissingTransport,
             hasStructuredOutput = true,
         )
-    }
 
     private fun requestReboot(): Boolean {
+        val artifactPaths = artifactPathsForExistingTransport() ?: return false
         val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
         val commands = buildList {
             add(listOf("su", "-c", REBOOT_COMMAND))
             if (helper.exists()) add(listOf(helper.absolutePath, "-c", REBOOT_COMMAND))
         }
         commands.forEach { command ->
-            val output = runCatching { runCommand(command).output }.getOrDefault("")
+            val environment = if (command.firstOrNull() == helper.absolutePath) {
+                artifactPaths.environment()
+            } else {
+                emptyMap()
+            }
+            val output = runCatching {
+                runCommand(command, environment = environment).output
+            }.getOrDefault("")
             appendLog("[*] Reboot attempt: ${output.ifBlank { "no output" }}")
             if (output.contains("UNROOT_REBOOT_REQUESTED")) return true
         }
 
         if (!hasShizukuPermission() ||
-            !File(SHIZUKU_CVE_SU).exists() ||
-            !File(SHIZUKU_CVE_SOCKET).exists()
+            !File(artifactPaths.suClient).exists() ||
+            !File(artifactPaths.suSocket).exists()
         ) return false
 
         val handle = runCatching { bindExploitService() }.getOrNull() ?: return false
         return try {
             val output = handle.service.exec(
-                "$SHIZUKU_CVE_SU -c ${shellQuote(REBOOT_COMMAND)}",
+                artifactPaths.cveSuShellCommand(REBOOT_COMMAND),
             )
             appendLog("[*] Shizuku CVE reboot attempt: $output")
             output.contains("UNROOT_REBOOT_REQUESTED")
@@ -892,8 +1126,11 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
     private fun runCommand(
         command: List<String>,
         timeoutSeconds: Long = COMMAND_TIMEOUT_SECONDS,
+        environment: Map<String, String> = emptyMap(),
     ): CommandResult {
-        val process = ProcessBuilder(command).redirectErrorStream(true).start()
+        val processBuilder = ProcessBuilder(command).redirectErrorStream(true)
+        processBuilder.environment().putAll(environment)
+        val process = processBuilder.start()
         val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
         if (!finished) {
             process.destroyForcibly()
@@ -905,8 +1142,8 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         )
     }
 
-    private fun awaitDaemonSocket() {
-        val sock = File("/data/local/tmp/temp_su.sock")
+    private fun awaitDaemonSocket(artifactPaths: TempArtifactPaths) {
+        val sock = File(artifactPaths.suSocket)
         val deadline = SystemClock.elapsedRealtime() + 15_000L
         while (SystemClock.elapsedRealtime() < deadline) {
             if (sock.exists()) return
@@ -914,22 +1151,31 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun diagnoseDaemon() {
+    private fun diagnoseDaemon(artifactPaths: TempArtifactPaths) {
         try {
             val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
             if (!helper.exists()) {
                 appendLog("[diag] helper binary missing")
                 return
             }
-            val suCheck = runHelper(helper, "-c",
-                "ls -la /apex/com.android.virt/bin/su /data/local/tmp/su 2>/dev/null || echo 'not found'")
+            val suCheck = runHelper(
+                helper,
+                artifactPaths,
+                "-c",
+                "ls -la /apex/com.android.virt/bin/su " +
+                    "${shellQuote(artifactPaths.suClient)} 2>/dev/null || echo 'not found'",
+            )
             appendLog("[diag] su binaries: ${suCheck.output.take(200)}")
 
-            val sockCheck = File("/data/local/tmp/temp_su.sock")
+            val sockCheck = File(artifactPaths.suSocket)
             appendLog("[diag] socket file: ${if (sockCheck.exists()) "present" else "NOT FOUND"}")
 
-            val logCheck = runHelper(helper, "-c",
-                "cat /data/local/tmp/su_daemon.log 2>/dev/null || echo 'empty'")
+            val logCheck = runHelper(
+                helper,
+                artifactPaths,
+                "-c",
+                "cat ${shellQuote(artifactPaths.suDaemonLog)} 2>/dev/null || echo 'empty'",
+            )
             appendLog("[diag] daemon log: ${logCheck.output.take(300)}")
         } catch (e: Exception) {
             appendLog("[diag] error: ${e.message}")
@@ -938,9 +1184,11 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
     fun softReboot() {
         viewModelScope.launch(Dispatchers.IO) {
+            val artifactPaths = artifactPathsForExistingTransport()
+                ?: return@launch
             val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
             if (!helper.exists()) return@launch
-            val result = runHelper(helper, "-c",
+            val result = runHelper(helper, artifactPaths, "-c",
                 "killall -9 system_server 2>/dev/null; true")
             appendLog("[*] Soft reboot triggered (exit ${result.code})")
         }
@@ -983,8 +1231,6 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         private const val COMMAND_TIMEOUT_CODE = 124
         private const val ROOT_PROBE_TIMEOUT_SECONDS = 10L
         private const val ROOT_ID_COMMAND = "id -u"
-        private const val SHIZUKU_CVE_SU = "/data/local/tmp/su"
-        private const val SHIZUKU_CVE_SOCKET = "/data/local/tmp/temp_su.sock"
         private val LOG_POLL_INTERVAL = 250.milliseconds
         private const val RESUKISU_PACKAGE = "com.resukisu.resukisu"
         private const val REBOOT_COMMAND =

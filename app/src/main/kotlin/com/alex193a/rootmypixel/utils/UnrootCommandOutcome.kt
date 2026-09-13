@@ -16,6 +16,7 @@ enum class UnrootIssue(
     RootHelper("cve-root", R.string.unroot_issue_cve_root),
     KernelSuLoader("ksud", R.string.unroot_issue_ksud),
     ExploitLogs("exploit-logs", R.string.unroot_issue_exploit_logs),
+    Workspace("workspace", R.string.unroot_issue_workspace),
     RootTransportFiles("root-transport-files", R.string.unroot_issue_root_transport_files),
     Reboot("reboot", R.string.unroot_issue_reboot),
     Unknown("unknown", R.string.unroot_issue_unknown),
@@ -34,6 +35,7 @@ enum class UnrootIssue(
             RootHelper,
             KernelSuLoader,
             ExploitLogs,
+            Workspace,
             RootTransportFiles,
         )
     }
