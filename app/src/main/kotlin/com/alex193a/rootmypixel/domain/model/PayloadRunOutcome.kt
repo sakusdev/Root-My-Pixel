@@ -16,6 +16,13 @@ enum class PayloadReason {
     NO_OBSERVED_EFFECT,
     UNKNOWN;
 
+    val permitsRetry: Boolean
+        get() = this in setOf(
+            CFI_STAGE_FAILED,
+            RECLAIM_SYSCALL_FAILED,
+            NO_OBSERVED_EFFECT,
+        )
+
     companion object {
         fun fromWire(value: String): PayloadReason =
             entries.firstOrNull { it.name == value } ?: UNKNOWN
@@ -121,9 +128,9 @@ object PayloadResultParser {
         val cleanup = fields[if (legacy) "cleanup_state" else "cleanup"]
             ?: return Result.Error(PayloadResultError.MALFORMED)
 
-        // Retry is meaningful only for a failed, recognized result. Unknown
-        // reasons stay fail-closed even if a future payload sets retryable=1.
-        val retryable = !success && wireRetryable && reason != PayloadReason.UNKNOWN
+        // Only explicitly transient failure classes may surface Retry. Terminal,
+        // safety-sensitive, unknown and successful outcomes stay fail-closed.
+        val retryable = !success && wireRetryable && reason.permitsRetry
         return Result.Success(
             PayloadRunOutcome(
                 runId = runId,
