@@ -52,6 +52,45 @@ class PayloadRunOutcomeTest {
     }
 
     @Test
+    fun versionedSuccess_isAcceptedWithoutLegacyMarkers() {
+        val log =
+            "RMP_PAYLOAD_RESULT:v1 run_id=x success=1 retryable=0 " +
+                "reason=OK stage=done attempts=1 cleanup=complete"
+
+        val parsed = PayloadResultParser.parse(log)
+        assertTrue(parsed is Result.Success)
+        assertTrue((parsed as Result.Success).data.success)
+        assertTrue(PayloadResultParser.hasLegacySuccessMarkers(log))
+    }
+
+    @Test
+    fun knownFailure_preservesRetryableFlag() {
+        val parsed = PayloadResultParser.parse(
+            "RMP_PAYLOAD_RESULT:v1 run_id=x success=0 retryable=1 " +
+                "reason=NO_OBSERVED_EFFECT stage=reclaim attempts=2 cleanup=complete",
+        )
+
+        assertTrue(parsed is Result.Success)
+        val outcome = (parsed as Result.Success).data
+        assertFalse(outcome.success)
+        assertTrue(outcome.retryable)
+        assertEquals(PayloadReason.NO_OBSERVED_EFFECT, outcome.reason)
+    }
+
+    @Test
+    fun successfulResult_isNeverRetryable() {
+        val parsed = PayloadResultParser.parse(
+            "RMP_PAYLOAD_RESULT:v1 run_id=x success=1 retryable=1 " +
+                "reason=OK stage=done attempts=1 cleanup=complete",
+        )
+
+        assertTrue(parsed is Result.Success)
+        val outcome = (parsed as Result.Success).data
+        assertTrue(outcome.success)
+        assertFalse(outcome.retryable)
+    }
+
+    @Test
     fun unknownReason_cannotEnableRetry() {
         val parsed = PayloadResultParser.parse(
             "RMP_PAYLOAD_RESULT:v1 run_id=x success=0 retryable=1 " +
