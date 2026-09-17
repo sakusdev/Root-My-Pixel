@@ -52,7 +52,17 @@ object PayloadResultParser {
 
     fun sanitizeForDisplay(raw: String): String = raw.replace(ansiPattern, "")
 
+    /**
+     * Backward-compatible success-marker check used by the install flow.
+     * Versioned structured success is authoritative; legacy done/root markers
+     * remain accepted for older payloads that predate RMP_PAYLOAD_RESULT:v1.
+     */
     fun hasLegacySuccessMarkers(raw: String): Boolean {
+        val parsed = parse(raw)
+        if (parsed is Result.Success && parsed.data.success) {
+            return true
+        }
+
         val clean = sanitizeForDisplay(raw)
         return clean.contains("done=1") && clean.contains("root=1")
     }
@@ -110,7 +120,10 @@ object PayloadResultParser {
             ?: return Result.Error(PayloadResultError.MALFORMED)
         val cleanup = fields[if (legacy) "cleanup_state" else "cleanup"]
             ?: return Result.Error(PayloadResultError.MALFORMED)
-        val retryable = wireRetryable && reason == PayloadReason.OK
+
+        // Retry is meaningful only for a failed, recognized result. Unknown
+        // reasons stay fail-closed even if a future payload sets retryable=1.
+        val retryable = !success && wireRetryable && reason != PayloadReason.UNKNOWN
         return Result.Success(
             PayloadRunOutcome(
                 runId = runId,
