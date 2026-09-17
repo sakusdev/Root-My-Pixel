@@ -10,7 +10,7 @@ class PayloadRunOutcomeTest {
     @Test
     fun parseVersionedRouteDisabled_isTerminal() {
         val parsed = PayloadResultParser.parse(
-            "RMP_PAYLOAD_RESULT:v1 run_id=42-1 success=0 retryable=0 " +
+            "RMP_PAYLOAD_RESULT:v1 run_id=42-1 success=0 retryable=1 " +
                 "reason=ROUTE_DISABLED stage=gate attempts=0 cleanup=not_needed",
         )
 
@@ -64,7 +64,7 @@ class PayloadRunOutcomeTest {
     }
 
     @Test
-    fun knownFailure_preservesRetryableFlag() {
+    fun knownTransientFailure_preservesRetryableFlag() {
         val parsed = PayloadResultParser.parse(
             "RMP_PAYLOAD_RESULT:v1 run_id=x success=0 retryable=1 " +
                 "reason=NO_OBSERVED_EFFECT stage=reclaim attempts=2 cleanup=complete",
