@@ -16,6 +16,13 @@ enum class PayloadReason {
     NO_OBSERVED_EFFECT,
     UNKNOWN;
 
+    val permitsRetry: Boolean
+        get() = this in setOf(
+            CFI_STAGE_FAILED,
+            RECLAIM_SYSCALL_FAILED,
+            NO_OBSERVED_EFFECT,
+        )
+
     companion object {
         fun fromWire(value: String): PayloadReason =
             entries.firstOrNull { it.name == value } ?: UNKNOWN
@@ -52,7 +59,17 @@ object PayloadResultParser {
 
     fun sanitizeForDisplay(raw: String): String = raw.replace(ansiPattern, "")
 
+    /**
+     * Backward-compatible success-marker check used by the install flow.
+     * Versioned structured success is authoritative; legacy done/root markers
+     * remain accepted for older payloads that predate RMP_PAYLOAD_RESULT:v1.
+     */
     fun hasLegacySuccessMarkers(raw: String): Boolean {
+        val parsed = parse(raw)
+        if (parsed is Result.Success && parsed.data.success) {
+            return true
+        }
+
         val clean = sanitizeForDisplay(raw)
         return clean.contains("done=1") && clean.contains("root=1")
     }
@@ -110,7 +127,10 @@ object PayloadResultParser {
             ?: return Result.Error(PayloadResultError.MALFORMED)
         val cleanup = fields[if (legacy) "cleanup_state" else "cleanup"]
             ?: return Result.Error(PayloadResultError.MALFORMED)
-        val retryable = wireRetryable && reason == PayloadReason.OK
+
+        // Only explicitly transient failure classes may surface Retry. Terminal,
+        // safety-sensitive, unknown and successful outcomes stay fail-closed.
+        val retryable = !success && wireRetryable && reason.permitsRetry
         return Result.Success(
             PayloadRunOutcome(
                 runId = runId,
